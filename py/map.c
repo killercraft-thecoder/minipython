@@ -153,53 +153,34 @@ static void mp_map_rehash(mp_map_t *map) {
 //  - returns slot, with key non-null and value=MP_OBJ_NULL if it was added
 // MP_MAP_LOOKUP_REMOVE_IF_FOUND behaviour:
 //  - returns NULL if not found, else the slot if was found in with key null and value non-null
-mp_map_elem_t *MICROPY_WRAP_MP_MAP_LOOKUP(mp_map_lookup)(mp_map_t * map, mp_obj_t index, mp_map_lookup_kind_t lookup_kind) {
-    // If the map is a fixed array then we must only be called for a lookup
+mp_map_elem_t *MICROPY_WRAP_MP_MAP_LOOKUP(mp_map_lookup)(
+    mp_map_t *map, mp_obj_t index, mp_map_lookup_kind_t lookup_kind) {
+
+    // Fixed array maps: only allow lookup
     assert(!map->is_fixed || lookup_kind == MP_MAP_LOOKUP);
 
     #if MICROPY_OPT_MAP_LOOKUP_CACHE
-    // Try the cache for lookup or add-if-not-found.
     if (lookup_kind != MP_MAP_LOOKUP_REMOVE_IF_FOUND && map->alloc) {
         mp_map_elem_t *slot = MAP_CACHE_GET(map, index);
-        // Note: Just comparing key for value equality will have false negatives, but
-        // these will be handled by the regular path below.
-        if (slot->key == index) {
+        if (slot && slot->key == index) {
             return slot;
         }
     }
     #endif
 
-    // Work out if we can compare just pointers
-    bool compare_only_ptrs = map->all_keys_are_qstrs;
-    if (compare_only_ptrs) {
-        if (mp_obj_is_qstr(index)) {
-            // Index is a qstr, so can just do ptr comparison.
-        } else if (mp_obj_is_exact_type(index, &mp_type_str)) {
-            // Index is a non-interned string.
-            // We can either intern the string, or force a full equality comparison.
-            // We chose the latter, since interning costs time and potentially RAM,
-            // and it won't necessarily benefit subsequent calls because these calls
-            // most likely won't pass the newly-interned string.
-            compare_only_ptrs = false;
-        } else if (lookup_kind != MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
-            // If we are not adding, then we can return straight away a failed
-            // lookup because we know that the index will never be found.
-            return NULL;
-        }
-    }
+    // Fast path: qstr keys
+    bool compare_only_ptrs = map->all_keys_are_qstrs && mp_obj_is_qstr(index);
 
-    // if the map is an ordered array then we must do a brute force linear search
+    // Ordered dicts: linear scan
     if (map->is_ordered) {
-        for (mp_map_elem_t *elem = &map->table[0], *top = &map->table[map->used]; elem < top; elem++) {
+        for (mp_map_elem_t *elem = map->table, *top = map->table + map->used;
+             elem < top; ++elem) {
             if (elem->key == index || (!compare_only_ptrs && mp_obj_equal(elem->key, index))) {
                 #if MICROPY_PY_COLLECTIONS_ORDEREDDICT
-                if (MP_UNLIKELY(lookup_kind == MP_MAP_LOOKUP_REMOVE_IF_FOUND)) {
-                    // remove the found element by moving the rest of the array down
+                if (lookup_kind == MP_MAP_LOOKUP_REMOVE_IF_FOUND) {
                     mp_obj_t value = elem->value;
                     --map->used;
                     memmove(elem, elem + 1, (top - elem - 1) * sizeof(*elem));
-                    // put the found element after the end so the caller can access it if needed
-                    // note: caller must NULL the value so the GC can clean up (e.g. see dict_get_helper).
                     elem = &map->table[map->used];
                     elem->key = MP_OBJ_NULL;
                     elem->value = value;
@@ -210,29 +191,25 @@ mp_map_elem_t *MICROPY_WRAP_MP_MAP_LOOKUP(mp_map_lookup)(mp_map_t * map, mp_obj_
             }
         }
         #if MICROPY_PY_COLLECTIONS_ORDEREDDICT
-        if (MP_LIKELY(lookup_kind != MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)) {
-            return NULL;
+        if (lookup_kind == MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
+            if (map->used == map->alloc) {
+                map->alloc += 4;
+                map->table = m_renew(mp_map_elem_t, map->table, map->used, map->alloc);
+                mp_seq_clear(map->table, map->used, map->alloc, sizeof(*map->table));
+            }
+            mp_map_elem_t *elem = &map->table[map->used++];
+            elem->key = index;
+            elem->value = MP_OBJ_NULL;
+            if (!mp_obj_is_qstr(index)) {
+                map->all_keys_are_qstrs = false;
+            }
+            return elem;
         }
-        if (map->used == map->alloc) {
-            // TODO: Alloc policy
-            map->alloc += 4;
-            map->table = m_renew(mp_map_elem_t, map->table, map->used, map->alloc);
-            mp_seq_clear(map->table, map->used, map->alloc, sizeof(*map->table));
-        }
-        mp_map_elem_t *elem = map->table + map->used++;
-        elem->key = index;
-        elem->value = MP_OBJ_NULL;
-        if (!mp_obj_is_qstr(index)) {
-            map->all_keys_are_qstrs = 0;
-        }
-        return elem;
-        #else
-        return NULL;
         #endif
+        return NULL;
     }
 
-    // map is a hash table (not an ordered array), so do a hash lookup
-
+    // Hash table lookup
     if (map->alloc == 0) {
         if (lookup_kind == MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
             mp_map_rehash(map);
@@ -241,79 +218,55 @@ mp_map_elem_t *MICROPY_WRAP_MP_MAP_LOOKUP(mp_map_lookup)(mp_map_t * map, mp_obj_
         }
     }
 
-    // get hash of index, with fast path for common case of qstr
-    mp_uint_t hash;
-    if (mp_obj_is_qstr(index)) {
-        hash = qstr_hash(MP_OBJ_QSTR_VALUE(index));
-    } else {
-        hash = MP_OBJ_SMALL_INT_VALUE(mp_unary_op(MP_UNARY_OP_HASH, index));
-    }
+    // Compute hash
+    mp_uint_t hash = mp_obj_is_qstr(index)
+        ? qstr_hash(MP_OBJ_QSTR_VALUE(index))
+        : MP_OBJ_SMALL_INT_VALUE(mp_unary_op(MP_UNARY_OP_HASH, index));
 
     size_t pos = hash % map->alloc;
     size_t start_pos = pos;
     mp_map_elem_t *avail_slot = NULL;
+
     for (;;) {
         mp_map_elem_t *slot = &map->table[pos];
-        if (slot->key == MP_OBJ_NULL) {
-            // found NULL slot, so index is not in table
+        mp_obj_t key = slot->key;
+
+        if (key == MP_OBJ_NULL) {
             if (lookup_kind == MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
-                map->used += 1;
-                if (avail_slot == NULL) {
-                    avail_slot = slot;
-                }
+                map->used++;
+                if (!avail_slot) avail_slot = slot;
                 avail_slot->key = index;
                 avail_slot->value = MP_OBJ_NULL;
-                if (!mp_obj_is_qstr(index)) {
-                    map->all_keys_are_qstrs = 0;
-                }
+                if (!mp_obj_is_qstr(index)) map->all_keys_are_qstrs = false;
                 return avail_slot;
-            } else {
-                return NULL;
             }
-        } else if (slot->key == MP_OBJ_SENTINEL) {
-            // found deleted slot, remember for later
-            if (avail_slot == NULL) {
-                avail_slot = slot;
-            }
-        } else if (slot->key == index || (!compare_only_ptrs && mp_obj_equal(slot->key, index))) {
-            // found index
-            // Note: CPython does not replace the index; try x={True:'true'};x[1]='one';x
+            return NULL;
+        }
+
+        if (key == MP_OBJ_SENTINEL) {
+            if (!avail_slot) avail_slot = slot;
+        } else if (key == index || (!compare_only_ptrs && mp_obj_equal(key, index))) {
             if (lookup_kind == MP_MAP_LOOKUP_REMOVE_IF_FOUND) {
-                // delete element in this slot
                 map->used--;
-                if (map->table[(pos + 1) % map->alloc].key == MP_OBJ_NULL) {
-                    // optimisation if next slot is empty
-                    slot->key = MP_OBJ_NULL;
-                } else {
-                    slot->key = MP_OBJ_SENTINEL;
-                }
-                // keep slot->value so that caller can access it if needed
+                mp_map_elem_t *next = &map->table[(pos + 1) % map->alloc];
+                slot->key = (next->key == MP_OBJ_NULL) ? MP_OBJ_NULL : MP_OBJ_SENTINEL;
             }
             MAP_CACHE_SET(index, pos);
             return slot;
         }
 
-        // not yet found, keep searching in this table
         pos = (pos + 1) % map->alloc;
-
         if (pos == start_pos) {
-            // search got back to starting position, so index is not in table
             if (lookup_kind == MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
-                if (avail_slot != NULL) {
-                    // there was an available slot, so use that
+                if (avail_slot) {
                     map->used++;
                     avail_slot->key = index;
                     avail_slot->value = MP_OBJ_NULL;
-                    if (!mp_obj_is_qstr(index)) {
-                        map->all_keys_are_qstrs = 0;
-                    }
+                    if (!mp_obj_is_qstr(index)) map->all_keys_are_qstrs = false;
                     return avail_slot;
-                } else {
-                    // not enough room in table, rehash it
-                    mp_map_rehash(map);
-                    // restart the search for the new element
-                    start_pos = pos = hash % map->alloc;
                 }
+                mp_map_rehash(map);
+                pos = start_pos = hash % map->alloc;
             } else {
                 return NULL;
             }
