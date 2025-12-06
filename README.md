@@ -2,7 +2,7 @@
 
 This is a modifed version of Micropython it aims to improve Micropython with new and modern things.
 
-The MicroPython project
+The MiniPython project (most of the README is just from micropython.)
 =======================
 <p align="center">
   <img src="https://raw.githubusercontent.com/micropython/micropython/master/logo/upython-with-micro.jpg" alt="MicroPython Logo"/>
