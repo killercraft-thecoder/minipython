@@ -130,20 +130,39 @@ void mp_map_clear(mp_map_t *map) {
 
 static void mp_map_rehash(mp_map_t *map) {
     size_t old_alloc = map->alloc;
-    size_t new_alloc = get_hash_alloc_greater_or_equal_to(map->alloc + 1);
+    size_t new_alloc = get_hash_alloc_greater_or_equal_to(old_alloc + 1);
     DEBUG_printf("mp_map_rehash(%p): " UINT_FMT " -> " UINT_FMT "\n", map, old_alloc, new_alloc);
+
     mp_map_elem_t *old_table = map->table;
-    mp_map_elem_t *new_table = m_new0(mp_map_elem_t, new_alloc);
-    // If we reach this point, table resizing succeeded, now we can edit the old map.
+    mp_map_elem_t *new_table = m_new(mp_map_elem_t, new_alloc);
+    memset(new_table, 0, new_alloc * sizeof(mp_map_elem_t));
+
     map->alloc = new_alloc;
     map->used = 0;
     map->all_keys_are_qstrs = 1;
     map->table = new_table;
+
     for (size_t i = 0; i < old_alloc; i++) {
-        if (old_table[i].key != MP_OBJ_NULL && old_table[i].key != MP_OBJ_SENTINEL) {
-            mp_map_lookup(map, old_table[i].key, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value = old_table[i].value;
+        mp_obj_t key = old_table[i].key;
+        if (key != MP_OBJ_NULL && key != MP_OBJ_SENTINEL) {
+            // Direct re-insertion avoids mp_map_lookup overhead
+            mp_uint_t hash = mp_obj_is_qstr(key)
+                ? qstr_hash(MP_OBJ_QSTR_VALUE(key))
+                : MP_OBJ_SMALL_INT_VALUE(mp_unary_op(MP_UNARY_OP_HASH, key));
+
+            size_t pos = hash % new_alloc;
+            while (new_table[pos].key != MP_OBJ_NULL) {
+                pos = (pos + 1) % new_alloc;
+            }
+            new_table[pos].key = key;
+            new_table[pos].value = old_table[i].value;
+            map->used++;
+            if (!mp_obj_is_qstr(key)) {
+                map->all_keys_are_qstrs = 0;
+            }
         }
     }
+
     m_del(mp_map_elem_t, old_table, old_alloc);
 }
 
