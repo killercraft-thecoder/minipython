@@ -61,16 +61,29 @@
 #define MICROPY_ALLOC_QSTR_ENTRIES_INIT (10)
 
 // this must match the equivalent function in makeqstrdata.py
+// djb2 variant, optimized for tight loops
 size_t qstr_compute_hash(const byte *data, size_t len) {
-    // djb2 algorithm; see http://www.cse.yorku.ca/~oz/hash.html
     size_t hash = 5381;
-    for (const byte *top = data + len; data < top; data++) {
-        hash = ((hash << 5) + hash) ^ (*data); // hash * 33 ^ data
+
+    // Process 4 bytes at a time when possible
+    size_t n = len >> 2;
+    while (n--) {
+        hash = ((hash << 5) + hash) ^ data[0];
+        hash = ((hash << 5) + hash) ^ data[1];
+        hash = ((hash << 5) + hash) ^ data[2];
+        hash = ((hash << 5) + hash) ^ data[3];
+        data += 4;
     }
+
+    // Handle remaining bytes
+    len &= 3;
+    while (len--) {
+        hash = ((hash << 5) + hash) ^ *data++;
+    }
+
     hash &= Q_HASH_MASK;
-    // Make sure that valid hash is never zero, zero means "hash not computed"
     if (hash == 0) {
-        hash++;
+        hash = 1;
     }
     return hash;
 }
@@ -208,55 +221,57 @@ static qstr qstr_add(mp_uint_t len, const char *q_ptr) {
     DEBUG_printf("QSTR: add len=%d data=%.*s\n", len, len, q_ptr);
     #endif
 
-    // make sure we have room in the pool for a new qstr
-    if (MP_STATE_VM(last_pool)->len >= MP_STATE_VM(last_pool)->alloc) {
-        size_t new_alloc = MP_STATE_VM(last_pool)->alloc * 2;
+    qstr_pool_t *pool = MP_STATE_VM(last_pool);
+
+    // Grow pool if needed
+    if (pool->len >= pool->alloc) {
+        size_t new_alloc = pool->alloc << 1; // faster than *2
         #ifdef MICROPY_QSTR_EXTRA_POOL
-        // Put a lower bound on the allocation size in case the extra qstr pool has few entries
         new_alloc = MAX(MICROPY_ALLOC_QSTR_ENTRIES_INIT, new_alloc);
         #endif
-        mp_uint_t pool_size = sizeof(qstr_pool_t)
+
+        size_t pool_size = sizeof(qstr_pool_t)
             + (sizeof(const char *)
                 #if MICROPY_QSTR_BYTES_IN_HASH
                 + sizeof(qstr_hash_t)
                 #endif
                 + sizeof(qstr_len_t)) * new_alloc;
-        qstr_pool_t *pool = (qstr_pool_t *)m_malloc_maybe(pool_size);
-        if (pool == NULL) {
-            // Keep qstr_last_chunk consistent with qstr_pool_t: qstr_last_chunk is not scanned
-            // at garbage collection since it's reachable from a qstr_pool_t.  And the caller of
-            // this function expects q_ptr to be stored in a qstr_pool_t so it can be reached
-            // by the collector.  If qstr_pool_t allocation failed, qstr_last_chunk needs to be
-            // NULL'd.  Otherwise it may become a dangling pointer at the next garbage collection.
+
+        qstr_pool_t *new_pool = (qstr_pool_t *)m_malloc_maybe(pool_size);
+        if (!new_pool) {
             MP_STATE_VM(qstr_last_chunk) = NULL;
             QSTR_EXIT();
             m_malloc_fail(new_alloc);
         }
+
+        // Setup contiguous arrays
         #if MICROPY_QSTR_BYTES_IN_HASH
-        pool->hashes = (qstr_hash_t *)(pool->qstrs + new_alloc);
-        pool->lengths = (qstr_len_t *)(pool->hashes + new_alloc);
+        new_pool->hashes = (qstr_hash_t *)(new_pool->qstrs + new_alloc);
+        new_pool->lengths = (qstr_len_t *)(new_pool->hashes + new_alloc);
         #else
-        pool->lengths = (qstr_len_t *)(pool->qstrs + new_alloc);
+        new_pool->lengths = (qstr_len_t *)(new_pool->qstrs + new_alloc);
         #endif
-        pool->prev = MP_STATE_VM(last_pool);
-        pool->total_prev_len = MP_STATE_VM(last_pool)->total_prev_len + MP_STATE_VM(last_pool)->len;
-        pool->alloc = new_alloc;
-        pool->len = 0;
-        MP_STATE_VM(last_pool) = pool;
-        DEBUG_printf("QSTR: allocate new pool of size %d\n", MP_STATE_VM(last_pool)->alloc);
+
+        new_pool->prev = pool;
+        new_pool->total_prev_len = pool->total_prev_len + pool->len;
+        new_pool->alloc = new_alloc;
+        new_pool->len = 0;
+        MP_STATE_VM(last_pool) = new_pool;
+
+        DEBUG_printf("QSTR: allocate new pool of size %d\n", new_alloc);
+        pool = new_pool;
     }
 
-    // add the new qstr
-    mp_uint_t at = MP_STATE_VM(last_pool)->len;
+    // Add new qstr entry
+    mp_uint_t at = pool->len;
     #if MICROPY_QSTR_BYTES_IN_HASH
-    MP_STATE_VM(last_pool)->hashes[at] = hash;
+    pool->hashes[at] = hash;
     #endif
-    MP_STATE_VM(last_pool)->lengths[at] = len;
-    MP_STATE_VM(last_pool)->qstrs[at] = q_ptr;
-    MP_STATE_VM(last_pool)->len++;
+    pool->lengths[at] = len;
+    pool->qstrs[at] = q_ptr;
+    pool->len = at + 1;
 
-    // return id for the newly-added qstr
-    return MP_STATE_VM(last_pool)->total_prev_len + at;
+    return pool->total_prev_len + at;
 }
 
 qstr qstr_find_strn(const char *str, size_t str_len) {
