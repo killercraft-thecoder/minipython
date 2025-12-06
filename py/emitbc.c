@@ -35,6 +35,7 @@
 #include "py/smallint.h"
 #include "py/emit.h"
 #include "py/bc0.h"
+#include "py/peephole.h"
 
 #if MICROPY_ENABLE_COMPILER
 
@@ -111,6 +112,42 @@ static void emit_write_code_info_byte(emit_t *emit, byte val) {
 
 static void emit_write_code_info_qstr(emit_t *emit, qstr qst) {
     mp_encode_uint(emit, emit_get_cur_to_write_code_info, mp_emit_common_use_qstr(emit->emit_common, qst));
+}
+
+static void emit_bc_load_cached0(emit_t *emit) {
+    emit_write_bytecode_byte(emit, MP_BC_LOAD_CACHED0);
+}
+
+static void emit_bc_cache_value0(emit_t *emit) {
+    emit_write_bytecode_byte(emit, MP_BC_CACHE_VALUE0);
+}
+
+static void emit_bc_uncache0(emit_t *emit) {
+    emit_write_bytecode_byte(emit, MP_BC_UNCACHE0);
+}
+
+static void emit_bc_load_cached1(emit_t *emit) {
+    emit_write_bytecode_byte(emit, MP_BC_LOAD_CACHED1);
+}
+
+static void emit_bc_cache_value1(emit_t *emit) {
+    emit_write_bytecode_byte(emit, MP_BC_CACHE_VALUE1);
+}
+
+static void emit_bc_uncache1(emit_t *emit) {
+    emit_write_bytecode_byte(emit, MP_BC_UNCACHE1);
+}
+
+static void emit_bc_cache_add(emit_t *emit) {
+    emit_write_bytecode_byte(emit, MP_BC_CACHE_ADD);
+}
+
+static void emit_bc_cache_sub(emit_t *emit) {
+    emit_write_bytecode_byte(emit, MP_BC_CACHE_SUB);
+}
+
+static void emit_bc_cache_add_full(emit_t *emit) {
+    emit_write_bytecode_byte(emit, MP_BC_CACHE_ADD_FULL);
 }
 
 #if MICROPY_ENABLE_SOURCE_LINE
@@ -400,6 +437,10 @@ bool mp_emit_bc_end_pass(emit_t *emit) {
         #endif
         #endif
 
+        // --- Peephole optimization step ---
+        // Optimize the bytecode buffer in place before assigning it.
+        bytecode_len = mp_peephole_optimize(emit->code_base, bytecode_len);
+
         // Bytecode is finalised, assign it to the raw code object.
         mp_emit_glue_assign_bytecode(emit->scope->raw_code, emit->code_base,
             emit->emit_common->children,
@@ -408,6 +449,8 @@ bool mp_emit_bc_end_pass(emit_t *emit) {
             emit->emit_common->ct_cur_child,
             #endif
             emit->scope->scope_flags);
+
+
     }
 
     return true;
@@ -464,8 +507,8 @@ void mp_emit_bc_label_assign(emit_t *emit, mp_uint_t l) {
 }
 
 void mp_emit_bc_import(emit_t *emit, qstr qst, int kind) {
-    MP_STATIC_ASSERT(MP_BC_IMPORT_NAME + MP_EMIT_IMPORT_NAME == MP_BC_IMPORT_NAME);
-    MP_STATIC_ASSERT(MP_BC_IMPORT_NAME + MP_EMIT_IMPORT_FROM == MP_BC_IMPORT_FROM);
+    MP_static_ASSERT(MP_BC_IMPORT_NAME + MP_EMIT_IMPORT_NAME == MP_BC_IMPORT_NAME);
+    MP_static_ASSERT(MP_BC_IMPORT_NAME + MP_EMIT_IMPORT_FROM == MP_BC_IMPORT_FROM);
     int stack_adj = kind == MP_EMIT_IMPORT_FROM ? 1 : -1;
     if (kind == MP_EMIT_IMPORT_STAR) {
         emit_write_bytecode_byte(emit, stack_adj, MP_BC_IMPORT_STAR);
@@ -475,8 +518,8 @@ void mp_emit_bc_import(emit_t *emit, qstr qst, int kind) {
 }
 
 void mp_emit_bc_load_const_tok(emit_t *emit, mp_token_kind_t tok) {
-    MP_STATIC_ASSERT(MP_BC_LOAD_CONST_FALSE + (MP_TOKEN_KW_NONE - MP_TOKEN_KW_FALSE) == MP_BC_LOAD_CONST_NONE);
-    MP_STATIC_ASSERT(MP_BC_LOAD_CONST_FALSE + (MP_TOKEN_KW_TRUE - MP_TOKEN_KW_FALSE) == MP_BC_LOAD_CONST_TRUE);
+    MP_static_ASSERT(MP_BC_LOAD_CONST_FALSE + (MP_TOKEN_KW_NONE - MP_TOKEN_KW_FALSE) == MP_BC_LOAD_CONST_NONE);
+    MP_static_ASSERT(MP_BC_LOAD_CONST_FALSE + (MP_TOKEN_KW_TRUE - MP_TOKEN_KW_FALSE) == MP_BC_LOAD_CONST_TRUE);
     if (tok == MP_TOKEN_ELLIPSIS) {
         emit_write_bytecode_byte_obj(emit, 1, MP_BC_LOAD_CONST_OBJ, MP_OBJ_FROM_PTR(&mp_const_ellipsis_obj));
     } else {
@@ -508,8 +551,8 @@ void mp_emit_bc_load_null(emit_t *emit) {
 }
 
 void mp_emit_bc_load_local(emit_t *emit, qstr qst, mp_uint_t local_num, int kind) {
-    MP_STATIC_ASSERT(MP_BC_LOAD_FAST_N + MP_EMIT_IDOP_LOCAL_FAST == MP_BC_LOAD_FAST_N);
-    MP_STATIC_ASSERT(MP_BC_LOAD_FAST_N + MP_EMIT_IDOP_LOCAL_DEREF == MP_BC_LOAD_DEREF);
+    MP_static_ASSERT(MP_BC_LOAD_FAST_N + MP_EMIT_IDOP_LOCAL_FAST == MP_BC_LOAD_FAST_N);
+    MP_static_ASSERT(MP_BC_LOAD_FAST_N + MP_EMIT_IDOP_LOCAL_DEREF == MP_BC_LOAD_DEREF);
     (void)qst;
     if (kind == MP_EMIT_IDOP_LOCAL_FAST && local_num <= 15) {
         emit_write_bytecode_byte(emit, 1, MP_BC_LOAD_FAST_MULTI + local_num);
@@ -519,8 +562,8 @@ void mp_emit_bc_load_local(emit_t *emit, qstr qst, mp_uint_t local_num, int kind
 }
 
 void mp_emit_bc_load_global(emit_t *emit, qstr qst, int kind) {
-    MP_STATIC_ASSERT(MP_BC_LOAD_NAME + MP_EMIT_IDOP_GLOBAL_NAME == MP_BC_LOAD_NAME);
-    MP_STATIC_ASSERT(MP_BC_LOAD_NAME + MP_EMIT_IDOP_GLOBAL_GLOBAL == MP_BC_LOAD_GLOBAL);
+    MP_static_ASSERT(MP_BC_LOAD_NAME + MP_EMIT_IDOP_GLOBAL_NAME == MP_BC_LOAD_NAME);
+    MP_static_ASSERT(MP_BC_LOAD_NAME + MP_EMIT_IDOP_GLOBAL_GLOBAL == MP_BC_LOAD_GLOBAL);
     (void)qst;
     emit_write_bytecode_byte_qstr(emit, 1, MP_BC_LOAD_NAME + kind, qst);
 }
@@ -559,8 +602,8 @@ void mp_emit_bc_attr(emit_t *emit, qstr qst, int kind) {
 }
 
 void mp_emit_bc_store_local(emit_t *emit, qstr qst, mp_uint_t local_num, int kind) {
-    MP_STATIC_ASSERT(MP_BC_STORE_FAST_N + MP_EMIT_IDOP_LOCAL_FAST == MP_BC_STORE_FAST_N);
-    MP_STATIC_ASSERT(MP_BC_STORE_FAST_N + MP_EMIT_IDOP_LOCAL_DEREF == MP_BC_STORE_DEREF);
+    MP_static_ASSERT(MP_BC_STORE_FAST_N + MP_EMIT_IDOP_LOCAL_FAST == MP_BC_STORE_FAST_N);
+    MP_static_ASSERT(MP_BC_STORE_FAST_N + MP_EMIT_IDOP_LOCAL_DEREF == MP_BC_STORE_DEREF);
     (void)qst;
     if (kind == MP_EMIT_IDOP_LOCAL_FAST && local_num <= 15) {
         emit_write_bytecode_byte(emit, -1, MP_BC_STORE_FAST_MULTI + local_num);
@@ -570,21 +613,21 @@ void mp_emit_bc_store_local(emit_t *emit, qstr qst, mp_uint_t local_num, int kin
 }
 
 void mp_emit_bc_store_global(emit_t *emit, qstr qst, int kind) {
-    MP_STATIC_ASSERT(MP_BC_STORE_NAME + MP_EMIT_IDOP_GLOBAL_NAME == MP_BC_STORE_NAME);
-    MP_STATIC_ASSERT(MP_BC_STORE_NAME + MP_EMIT_IDOP_GLOBAL_GLOBAL == MP_BC_STORE_GLOBAL);
+    MP_static_ASSERT(MP_BC_STORE_NAME + MP_EMIT_IDOP_GLOBAL_NAME == MP_BC_STORE_NAME);
+    MP_static_ASSERT(MP_BC_STORE_NAME + MP_EMIT_IDOP_GLOBAL_GLOBAL == MP_BC_STORE_GLOBAL);
     emit_write_bytecode_byte_qstr(emit, -1, MP_BC_STORE_NAME + kind, qst);
 }
 
 void mp_emit_bc_delete_local(emit_t *emit, qstr qst, mp_uint_t local_num, int kind) {
-    MP_STATIC_ASSERT(MP_BC_DELETE_FAST + MP_EMIT_IDOP_LOCAL_FAST == MP_BC_DELETE_FAST);
-    MP_STATIC_ASSERT(MP_BC_DELETE_FAST + MP_EMIT_IDOP_LOCAL_DEREF == MP_BC_DELETE_DEREF);
+    MP_static_ASSERT(MP_BC_DELETE_FAST + MP_EMIT_IDOP_LOCAL_FAST == MP_BC_DELETE_FAST);
+    MP_static_ASSERT(MP_BC_DELETE_FAST + MP_EMIT_IDOP_LOCAL_DEREF == MP_BC_DELETE_DEREF);
     (void)qst;
     emit_write_bytecode_byte_uint(emit, 0, MP_BC_DELETE_FAST + kind, local_num);
 }
 
 void mp_emit_bc_delete_global(emit_t *emit, qstr qst, int kind) {
-    MP_STATIC_ASSERT(MP_BC_DELETE_NAME + MP_EMIT_IDOP_GLOBAL_NAME == MP_BC_DELETE_NAME);
-    MP_STATIC_ASSERT(MP_BC_DELETE_NAME + MP_EMIT_IDOP_GLOBAL_GLOBAL == MP_BC_DELETE_GLOBAL);
+    MP_static_ASSERT(MP_BC_DELETE_NAME + MP_EMIT_IDOP_GLOBAL_NAME == MP_BC_DELETE_NAME);
+    MP_static_ASSERT(MP_BC_DELETE_NAME + MP_EMIT_IDOP_GLOBAL_GLOBAL == MP_BC_DELETE_GLOBAL);
     emit_write_bytecode_byte_qstr(emit, 0, MP_BC_DELETE_NAME + kind, qst);
 }
 
@@ -648,9 +691,9 @@ void mp_emit_bc_unwind_jump(emit_t *emit, mp_uint_t label, mp_uint_t except_dept
 }
 
 void mp_emit_bc_setup_block(emit_t *emit, mp_uint_t label, int kind) {
-    MP_STATIC_ASSERT(MP_BC_SETUP_WITH + MP_EMIT_SETUP_BLOCK_WITH == MP_BC_SETUP_WITH);
-    MP_STATIC_ASSERT(MP_BC_SETUP_WITH + MP_EMIT_SETUP_BLOCK_EXCEPT == MP_BC_SETUP_EXCEPT);
-    MP_STATIC_ASSERT(MP_BC_SETUP_WITH + MP_EMIT_SETUP_BLOCK_FINALLY == MP_BC_SETUP_FINALLY);
+    MP_static_ASSERT(MP_BC_SETUP_WITH + MP_EMIT_SETUP_BLOCK_WITH == MP_BC_SETUP_WITH);
+    MP_static_ASSERT(MP_BC_SETUP_WITH + MP_EMIT_SETUP_BLOCK_EXCEPT == MP_BC_SETUP_EXCEPT);
+    MP_static_ASSERT(MP_BC_SETUP_WITH + MP_EMIT_SETUP_BLOCK_FINALLY == MP_BC_SETUP_FINALLY);
     // The SETUP_WITH opcode pops ctx_mgr from the top of the stack
     // and then pushes 3 entries: __exit__, ctx_mgr, as_value.
     int stack_adj = kind == MP_EMIT_SETUP_BLOCK_WITH ? 2 : 0;
@@ -730,11 +773,11 @@ void mp_emit_bc_binary_op(emit_t *emit, mp_binary_op_t op) {
 }
 
 void mp_emit_bc_build(emit_t *emit, mp_uint_t n_args, int kind) {
-    MP_STATIC_ASSERT(MP_BC_BUILD_TUPLE + MP_EMIT_BUILD_TUPLE == MP_BC_BUILD_TUPLE);
-    MP_STATIC_ASSERT(MP_BC_BUILD_TUPLE + MP_EMIT_BUILD_LIST == MP_BC_BUILD_LIST);
-    MP_STATIC_ASSERT(MP_BC_BUILD_TUPLE + MP_EMIT_BUILD_MAP == MP_BC_BUILD_MAP);
-    MP_STATIC_ASSERT(MP_BC_BUILD_TUPLE + MP_EMIT_BUILD_SET == MP_BC_BUILD_SET);
-    MP_STATIC_ASSERT(MP_BC_BUILD_TUPLE + MP_EMIT_BUILD_SLICE == MP_BC_BUILD_SLICE);
+    MP_static_ASSERT(MP_BC_BUILD_TUPLE + MP_EMIT_BUILD_TUPLE == MP_BC_BUILD_TUPLE);
+    MP_static_ASSERT(MP_BC_BUILD_TUPLE + MP_EMIT_BUILD_LIST == MP_BC_BUILD_LIST);
+    MP_static_ASSERT(MP_BC_BUILD_TUPLE + MP_EMIT_BUILD_MAP == MP_BC_BUILD_MAP);
+    MP_static_ASSERT(MP_BC_BUILD_TUPLE + MP_EMIT_BUILD_SET == MP_BC_BUILD_SET);
+    MP_static_ASSERT(MP_BC_BUILD_TUPLE + MP_EMIT_BUILD_SLICE == MP_BC_BUILD_SLICE);
     int stack_adj = kind == MP_EMIT_BUILD_MAP ? 1 : 1 - n_args;
     emit_write_bytecode_byte_uint(emit, stack_adj, MP_BC_BUILD_TUPLE + kind, n_args);
 }
@@ -815,15 +858,15 @@ void mp_emit_bc_return_value(emit_t *emit) {
 }
 
 void mp_emit_bc_raise_varargs(emit_t *emit, mp_uint_t n_args) {
-    MP_STATIC_ASSERT(MP_BC_RAISE_LAST + 1 == MP_BC_RAISE_OBJ);
-    MP_STATIC_ASSERT(MP_BC_RAISE_LAST + 2 == MP_BC_RAISE_FROM);
+    MP_static_ASSERT(MP_BC_RAISE_LAST + 1 == MP_BC_RAISE_OBJ);
+    MP_static_ASSERT(MP_BC_RAISE_LAST + 2 == MP_BC_RAISE_FROM);
     assert(n_args <= 2);
     emit_write_bytecode_byte(emit, -n_args, MP_BC_RAISE_LAST + n_args);
     emit->suppress = true;
 }
 
 void mp_emit_bc_yield(emit_t *emit, int kind) {
-    MP_STATIC_ASSERT(MP_BC_YIELD_VALUE + 1 == MP_BC_YIELD_FROM);
+    MP_static_ASSERT(MP_BC_YIELD_VALUE + 1 == MP_BC_YIELD_FROM);
     emit_write_bytecode_byte(emit, -kind, MP_BC_YIELD_VALUE + kind);
     emit->scope->scope_flags |= MP_SCOPE_FLAG_GENERATOR;
 }
@@ -908,6 +951,17 @@ const emit_method_table_t emit_bc_method_table = {
 
     mp_emit_bc_start_except_handler,
     mp_emit_bc_end_except_handler,
+
+    emit_bc_load_cached0,
+    emit_bc_cache_value0,
+    emit_bc_uncache0,
+    emit_bc_load_cached1,
+    emit_bc_cache_value1,
+    emit_bc_uncache1,
+    emit_bc_cache_add,
+    emit_bc_cache_sub,
+    emit_bc_cache_add_full,
+
 };
 #else
 const mp_emit_method_table_id_ops_t mp_emit_bc_method_table_load_id_ops = {

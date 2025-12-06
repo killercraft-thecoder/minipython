@@ -251,8 +251,18 @@ typedef struct _mp_code_state_t {
     #endif
     // Variable-length
     mp_obj_t state[0];
+
     // Variable-length, never accessed by name, only as (void*)(state + n_state)
     // mp_exc_stack_t exc_state[0];
+
+    // Varible Cache
+    mp_obj_t cached_values[2];
+    // Self and Method Caches
+    mp_obj_t cached_self0;   // the object instance
+    mp_obj_t cached_method0; // the bound method/function object
+
+
+
 } mp_code_state_t;
 
 // State for an executing native function (based on mp_code_state_t).

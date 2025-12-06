@@ -60,9 +60,20 @@
 #define MP_BC_BASE_BYTE_O                   (0x50) // LLLLSSDTTTTTEEFF
 #define MP_BC_BASE_BYTE_E                   (0x60) // --BREEEYYI------
 #define MP_BC_LOAD_CONST_SMALL_INT_MULTI    (0x70) // LLLLLLLLLLLLLLLL
-//                                          (0x80) // LLLLLLLLLLLLLLLL
-//                                          (0x90) // LLLLLLLLLLLLLLLL
-//                                          (0xa0) // LLLLLLLLLLLLLLLL
+#define MP_BC_LOAD_CACHED0                  (0x80)
+#define MP_BC_CACHE_VALUE0                  (0x81)
+#define MP_BC_UNCACHE0                      (0x82)
+#define MP_BC_CACHE_ADD                     (0x83)
+#define MP_BC_CACHE_SUB                     (0x84)
+#define MP_BC_CACHE_ADD_FULL                (0x85)
+
+#define MP_BC_LOAD_CACHED1                  (0x90)
+#define MP_BC_CACHE_VALUE1                  (0x91)
+#define MP_BC_UNCACHE1                      (0x92)
+#define MP_BC_INC_FAST                      (0x93)
+#define MP_BC_DEC_FAST                      (0x94)
+#define MP_BC_CALL_METHOD_CACHED            (0x95)
+#define MP_BC_CACHE_METHOD0                 (0x96)
 #define MP_BC_LOAD_FAST_MULTI               (0xb0) // LLLLLLLLLLLLLLLL
 #define MP_BC_STORE_FAST_MULTI              (0xc0) // SSSSSSSSSSSSSSSS
 #define MP_BC_UNARY_OP_MULTI                (0xd0) // OOOOOOO
