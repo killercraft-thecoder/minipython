@@ -319,9 +319,6 @@ static void mp_set_rehash(mp_set_t *set) {
 }
 
 mp_obj_t mp_set_lookup(mp_set_t *set, mp_obj_t index, mp_map_lookup_kind_t lookup_kind) {
-    // Note: lookup_kind can be MP_MAP_LOOKUP_ADD_IF_NOT_FOUND_OR_REMOVE_IF_FOUND which
-    // is handled by using bitwise operations.
-
     if (set->alloc == 0) {
         if (lookup_kind & MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
             mp_set_rehash(set);
@@ -329,61 +326,55 @@ mp_obj_t mp_set_lookup(mp_set_t *set, mp_obj_t index, mp_map_lookup_kind_t looku
             return MP_OBJ_NULL;
         }
     }
+
     mp_uint_t hash = MP_OBJ_SMALL_INT_VALUE(mp_unary_op(MP_UNARY_OP_HASH, index));
     size_t pos = hash % set->alloc;
     size_t start_pos = pos;
     mp_obj_t *avail_slot = NULL;
+
     for (;;) {
         mp_obj_t elem = set->table[pos];
+
         if (elem == MP_OBJ_NULL) {
-            // found NULL slot, so index is not in table
+            // Empty slot
             if (lookup_kind & MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
-                if (avail_slot == NULL) {
+                if (!avail_slot) {
                     avail_slot = &set->table[pos];
                 }
                 set->used++;
                 *avail_slot = index;
                 return index;
-            } else {
-                return MP_OBJ_NULL;
             }
-        } else if (elem == MP_OBJ_SENTINEL) {
-            // found deleted slot, remember for later
-            if (avail_slot == NULL) {
+            return MP_OBJ_NULL;
+        }
+
+        if (elem == MP_OBJ_SENTINEL) {
+            // Deleted slot
+            if (!avail_slot) {
                 avail_slot = &set->table[pos];
             }
-        } else if (mp_obj_equal(elem, index)) {
-            // found index
+        } else if (elem == index || mp_obj_equal(elem, index)) {
+            // Found
             if (lookup_kind & MP_MAP_LOOKUP_REMOVE_IF_FOUND) {
-                // delete element
                 set->used--;
-                if (set->table[(pos + 1) % set->alloc] == MP_OBJ_NULL) {
-                    // optimisation if next slot is empty
-                    set->table[pos] = MP_OBJ_NULL;
-                } else {
-                    set->table[pos] = MP_OBJ_SENTINEL;
-                }
+                mp_obj_t next = set->table[(pos + 1) % set->alloc];
+                set->table[pos] = (next == MP_OBJ_NULL) ? MP_OBJ_NULL : MP_OBJ_SENTINEL;
             }
             return elem;
         }
 
-        // not yet found, keep searching in this table
+        // Linear probe
         pos = (pos + 1) % set->alloc;
-
         if (pos == start_pos) {
-            // search got back to starting position, so index is not in table
+            // Full cycle
             if (lookup_kind & MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
-                if (avail_slot != NULL) {
-                    // there was an available slot, so use that
+                if (avail_slot) {
                     set->used++;
                     *avail_slot = index;
                     return index;
-                } else {
-                    // not enough room in table, rehash it
-                    mp_set_rehash(set);
-                    // restart the search for the new element
-                    start_pos = pos = hash % set->alloc;
                 }
+                mp_set_rehash(set);
+                pos = start_pos = hash % set->alloc;
             } else {
                 return MP_OBJ_NULL;
             }
@@ -392,17 +383,13 @@ mp_obj_t mp_set_lookup(mp_set_t *set, mp_obj_t index, mp_map_lookup_kind_t looku
 }
 
 mp_obj_t mp_set_remove_first(mp_set_t *set) {
-    for (size_t pos = 0; pos < set->alloc; pos++) {
-        if (mp_set_slot_is_filled(set, pos)) {
-            mp_obj_t elem = set->table[pos];
-            // delete element
+    for (size_t pos = 0, n = set->alloc; pos < n; ++pos) {
+        mp_obj_t elem = set->table[pos];
+        if (elem != MP_OBJ_NULL && elem != MP_OBJ_SENTINEL) {
+            // Found filled slot
             set->used--;
-            if (set->table[(pos + 1) % set->alloc] == MP_OBJ_NULL) {
-                // optimisation if next slot is empty
-                set->table[pos] = MP_OBJ_NULL;
-            } else {
-                set->table[pos] = MP_OBJ_SENTINEL;
-            }
+            mp_obj_t next = set->table[(pos + 1) % n];
+            set->table[pos] = (next == MP_OBJ_NULL) ? MP_OBJ_NULL : MP_OBJ_SENTINEL;
             return elem;
         }
     }

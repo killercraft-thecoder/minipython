@@ -177,14 +177,16 @@ static void cache_bind_slot(cache_map_t *m, int slot, int local) {
 // 1) slot0 += slot1
 //    LOAD_CACHED0
 //    LOAD_CACHED1
-//    BINARY_OP (ADD)
-//    STORE_FAST <slot0_local>
+//    BINARY_OP_MULTI_NUM (ADD)
+//    STORE_FAST_N <slot0_local>
 // -> CACHE_ADD_FULL
-static int rule_cache_add_full(rewrite_t *rw, size_t off, instr_t i0, instr_t i1, instr_t i2, instr_t i3, const cache_map_t *cm) {
+static int rule_cache_add_full(rewrite_t *rw, size_t off,
+                               instr_t i0, instr_t i1, instr_t i2, instr_t i3,
+                               const cache_map_t *cm) {
     if (i0.op != MP_BC_LOAD_CACHED0) return 0;
     if (i1.op != MP_BC_LOAD_CACHED1) return 0;
-    if (i2.op != MP_BC_BINARY_OP || !i2.has_arg || i2.arg != MP_BINARY_OP_ADD) return 0;
-    if (i3.op != MP_BC_STORE_FAST || !i3.has_arg) return 0;
+    if (i2.op != MP_BC_BINARY_OP_MULTI_NUM || !i2.has_arg || i2.arg != MP_BINARY_OP_ADD) return 0;
+    if (i3.op != MP_BC_STORE_FAST_N || !i3.has_arg) return 0;
     if (cm->slot0_local < 0 || (int)i3.arg != cm->slot0_local) return 0;
 
     replace_instr_with_single(rw, off, i0, MP_BC_CACHE_ADD_FULL);
@@ -193,37 +195,22 @@ static int rule_cache_add_full(rewrite_t *rw, size_t off, instr_t i0, instr_t i1
     return 1;
 }
 
-// 2) slot0 -= slot1
-//    LOAD_CACHED0
-//    LOAD_CACHED1
-//    BINARY_OP (SUBTRACT)
-//    STORE_FAST <slot0_local>
-// -> CACHE_SUB (slot-to-slot semantics)
-static int rule_cache_sub_full(rewrite_t *rw, size_t off, instr_t i0, instr_t i1, instr_t i2, instr_t i3, const cache_map_t *cm) {
-    if (i0.op != MP_BC_LOAD_CACHED0) return 0;
-    if (i1.op != MP_BC_LOAD_CACHED1) return 0;
-    if (i2.op != MP_BC_BINARY_OP || !i2.has_arg || i2.arg != MP_BINARY_OP_SUBTRACT) return 0;
-    if (i3.op != MP_BC_STORE_FAST || !i3.has_arg) return 0;
-    if (cm->slot0_local < 0 || (int)i3.arg != cm->slot0_local) return 0;
-
-    replace_instr_with_single(rw, off, i0, MP_BC_CACHE_SUB);
-    mark_remove(rw, off + i0.len, i1.len + i2.len + i3.len);
-    return 1;
-}
-
-// 3) Seed cache slots for x += y pattern:
-//    LOAD_FAST x
-//    LOAD_FAST y
-//    BINARY_OP (ADD)
-//    STORE_FAST x
-// -> CACHE_VALUE0   (seed x into slot0)
-//    CACHE_VALUE1   (seed y into slot1)
+// 2) Seed cache slots for x += y pattern:
+//    LOAD_FAST_N x
+//    LOAD_FAST_N y
+//    BINARY_OP_MULTI_NUM (ADD)
+//    STORE_FAST_N x
+// -> CACHE_VALUE0   (seed x into slot0) [implicit via cache_bind_slot]
+//    CACHE_VALUE1   (seed y into slot1) [implicit via cache_bind_slot]
 //    CACHE_ADD_FULL
-static int rule_seed_and_collapse_add(rewrite_t *rw, size_t off, instr_t i0, instr_t i1, instr_t i2, instr_t i3, cache_map_t *cm) {
-    if (i0.op != MP_BC_LOAD_FAST || !i0.has_arg) return 0;
-    if (i1.op != MP_BC_LOAD_FAST || !i1.has_arg) return 0;
-    if (i2.op != MP_BC_BINARY_OP || !i2.has_arg || i2.arg != MP_BINARY_OP_ADD) return 0;
-    if (i3.op != MP_BC_STORE_FAST || !i3.has_arg) return 0;
+static int rule_seed_and_collapse_add(rewrite_t *rw, size_t off,
+                                      instr_t i0, instr_t i1, instr_t i2, instr_t i3,
+                                      cache_map_t *cm) {
+    if (i0.op != MP_BC_LOAD_FAST_N || !i0.has_arg) return 0;
+    if (i1.op != MP_BC_LOAD_FAST_N || !i1.has_arg) return 0;
+    if (i2.op != MP_BC_BINARY_OP_MULTI_NUM || !i2.has_arg || i2.arg != MP_BINARY_OP_ADD) return 0;
+    if (i3.op != MP_BC_STORE_FAST_N || !i3.has_arg) return 0;
+
     int x = (int)i0.arg;
     int y = (int)i1.arg;
     if ((int)i3.arg != x) return 0;
@@ -233,41 +220,16 @@ static int rule_seed_and_collapse_add(rewrite_t *rw, size_t off, instr_t i0, ins
     cache_bind_slot(cm, 1, y);
 
     // Transform: place CACHE_ADD_FULL at i0 and remove the rest.
-    // Optionally, you could first write CACHE_VALUE0/CACHE_VALUE1 nearby,
-    // but if your VM semantics allow direct collapse into CACHE_ADD_FULL
-    // (because slot0/slot1 were pre-seeded earlier in the loop), prefer the collapse.
     replace_instr_with_single(rw, off, i0, MP_BC_CACHE_ADD_FULL);
     mark_remove(rw, off + i0.len, i1.len + i2.len + i3.len);
     return 1;
 }
 
-// 4) Seed cache for x -= y
-//    LOAD_FAST x
-//    LOAD_FAST y
-//    BINARY_OP (SUBTRACT)
-//    STORE_FAST x
-// -> CACHE_SUB (slot-to-slot)
-static int rule_seed_and_collapse_sub(rewrite_t *rw, size_t off, instr_t i0, instr_t i1, instr_t i2, instr_t i3, cache_map_t *cm) {
-    if (i0.op != MP_BC_LOAD_FAST || !i0.has_arg) return 0;
-    if (i1.op != MP_BC_LOAD_FAST || !i1.has_arg) return 0;
-    if (i2.op != MP_BC_BINARY_OP || !i2.has_arg || i2.arg != MP_BINARY_OP_SUBTRACT) return 0;
-    if (i3.op != MP_BC_STORE_FAST || !i3.has_arg) return 0;
-    int x = (int)i0.arg;
-    int y = (int)i1.arg;
-    if ((int)i3.arg != x) return 0;
-
-    cache_bind_slot(cm, 0, x);
-    cache_bind_slot(cm, 1, y);
-
-    replace_instr_with_single(rw, off, i0, MP_BC_CACHE_SUB);
-    mark_remove(rw, off + i0.len, i1.len + i2.len + i3.len);
-    return 1;
-}
-
-// 5) Promote repeated LOAD_FAST of a hot local to LOAD_CACHED0/1,
+// 3) Promote repeated LOAD_FAST of a hot local to LOAD_CACHED0/1,
 //    after we bound the local to a cache slot via previous rules.
-static int rule_promote_fast_to_cached(rewrite_t *rw, size_t off, instr_t i0, const cache_map_t *cm) {
-    if (i0.op != MP_BC_LOAD_FAST || !i0.has_arg) return 0;
+static int rule_promote_fast_to_cached(rewrite_t *rw, size_t off,
+                                       instr_t i0, const cache_map_t *cm) {
+    if (i0.op != MP_BC_LOAD_FAST_N || !i0.has_arg) return 0;
     int local = (int)i0.arg;
     if (cache_is_slot_local(cm, 0, local)) {
         replace_instr_with_single(rw, off, i0, MP_BC_LOAD_CACHED0);
@@ -280,19 +242,28 @@ static int rule_promote_fast_to_cached(rewrite_t *rw, size_t off, instr_t i0, co
     return 0;
 }
 
-// 6) Collapse explicit cached adds where store is implicit (accumulator pattern):
+// 4) Collapse explicit cached adds where store is implicit (accumulator pattern):
 //    LOAD_CACHED0
-//    <operand comes from stack>
-//    BINARY_OP (ADD)
-//    STORE_FAST <slot0_local>
+//    <operand comes from stack: LOAD_FAST_N or LOAD_CONST_SMALL_INT>
+//    BINARY_OP_MULTI_NUM (ADD)
+//    STORE_FAST_N <slot0_local>
 // -> CACHE_ADD (slot0 += TOS), if your CACHE_ADD is defined for slot + TOS.
-static int rule_cache_add_slot_stack(rewrite_t *rw, size_t off, instr_t i0, instr_t i1, instr_t i2, instr_t i3, const cache_map_t *cm) {
+static int rule_cache_add_slot_stack(rewrite_t *rw, size_t off,
+                                     instr_t i0, instr_t i1, instr_t i2, instr_t i3,
+                                     const cache_map_t *cm) {
     if (i0.op != MP_BC_LOAD_CACHED0) return 0;
-    // i1: any instruction that leaves an operand on TOS (conservatively accept LOAD_FAST and LOAD_CONST)
-    int operand_ok = (i1.op == MP_BC_LOAD_FAST && i1.has_arg) || (i1.op == MP_BC_LOAD_CONST_SMALL_INT && i1.has_arg);
+    // conservatively accept operand producers that leave TOS: LOAD_FAST_N or LOAD_CONST_SMALL_INT
+    int operand_ok =
+        (i1.op == MP_BC_LOAD_FAST_N && i1.has_arg) ||
+        (i1.op == MP_BC_LOAD_CONST_SMALL_INT && i1.has_arg);
     if (!operand_ok) return 0;
-    if (i2.op != MP_BC_BINARY_OP || !i2.has_arg || i2.arg != MP_BINARY_OP_ADD) return 0;
-    if (i3.op != MP_BC_STORE_FAST || !i3.has_arg || cm->slot0_local < 0 || (int)i3.arg != cm->slot0_local) return 0;
+
+    if (i2.op != MP_BC_BINARY_OP_MULTI_NUM || !i2.has_arg || i2.arg != MP_BINARY_OP_ADD) return 0;
+
+    if (i3.op != MP_BC_STORE_FAST_N || !i3.has_arg ||
+        cm->slot0_local < 0 || (int)i3.arg != cm->slot0_local) {
+        return 0;
+    }
 
     replace_instr_with_single(rw, off, i0, MP_BC_CACHE_ADD);
     // remove i1, i2, i3 (operand load + binary_op + store)
@@ -300,14 +271,14 @@ static int rule_cache_add_slot_stack(rewrite_t *rw, size_t off, instr_t i0, inst
     return 1;
 }
 
-// Rule: LOAD_FAST x; LOAD_CONST_SMALL_INT 1; BINARY_OP_ADD; STORE_FAST x
+// 5) Rule: LOAD_FAST_N x; LOAD_CONST_SMALL_INT 1; BINARY_OP_MULTI_NUM ADD; STORE_FAST_N x
 //       → INC_FAST x
 static int rule_inc_fast(rewrite_t *rw, size_t off,
                          instr_t i0, instr_t i1, instr_t i2, instr_t i3) {
-    if (i0.op != MP_BC_LOAD_FAST || !i0.has_arg) return 0;
+    if (i0.op != MP_BC_LOAD_FAST_N || !i0.has_arg) return 0;
     if (i1.op != MP_BC_LOAD_CONST_SMALL_INT || !i1.has_arg || i1.arg != 1) return 0;
-    if (i2.op != MP_BC_BINARY_OP || !i2.has_arg || i2.arg != MP_BINARY_OP_ADD) return 0;
-    if (i3.op != MP_BC_STORE_FAST || !i3.has_arg) return 0;
+    if (i2.op != MP_BC_BINARY_OP_MULTI_NUM || !i2.has_arg || i2.arg != MP_BINARY_OP_ADD) return 0;
+    if (i3.op != MP_BC_STORE_FAST_N || !i3.has_arg) return 0;
     if (i0.arg != i3.arg) return 0; // must store back to same local
 
     // Replace first instruction with INC_FAST <local>
@@ -317,14 +288,14 @@ static int rule_inc_fast(rewrite_t *rw, size_t off,
     return 1;
 }
 
-// Rule: LOAD_FAST x; LOAD_CONST_SMALL_INT 1; BINARY_OP_SUBTRACT; STORE_FAST x
+// 6) Rule: LOAD_FAST_N x; LOAD_CONST_SMALL_INT 1; BINARY_OP_MULTI_NUM SUBTRACT; STORE_FAST_N x
 //       → DEC_FAST x
 static int rule_dec_fast(rewrite_t *rw, size_t off,
                          instr_t i0, instr_t i1, instr_t i2, instr_t i3) {
-    if (i0.op != MP_BC_LOAD_FAST || !i0.has_arg) return 0;
+    if (i0.op != MP_BC_LOAD_FAST_N || !i0.has_arg) return 0;
     if (i1.op != MP_BC_LOAD_CONST_SMALL_INT || !i1.has_arg || i1.arg != 1) return 0;
-    if (i2.op != MP_BC_BINARY_OP || !i2.has_arg || i2.arg != MP_BINARY_OP_SUBTRACT) return 0;
-    if (i3.op != MP_BC_STORE_FAST || !i3.has_arg) return 0;
+    if (i2.op != MP_BC_BINARY_OP_MULTI_NUM || !i2.has_arg || i2.arg != MP_BINARY_OP_SUBTRACT) return 0;
+    if (i3.op != MP_BC_STORE_FAST_N || !i3.has_arg) return 0;
     if (i0.arg != i3.arg) return 0; // must store back to same local
 
     // Replace first instruction with DEC_FAST <local>
@@ -334,11 +305,11 @@ static int rule_dec_fast(rewrite_t *rw, size_t off,
     return 1;
 }
 
-// Rule: LOAD_FAST <local>; LOAD_METHOD <qstr>
+// 7) Rule: LOAD_FAST_N <local>; LOAD_METHOD <qstr>
 //       → CACHE_METHOD0 <local>, <qstr>
 static int rule_cache_method0(rewrite_t *rw, size_t off,
                               instr_t i0, instr_t i1) {
-    if (i0.op != MP_BC_LOAD_FAST || !i0.has_arg) return 0;
+    if (i0.op != MP_BC_LOAD_FAST_N || !i0.has_arg) return 0;
     if (i1.op != MP_BC_LOAD_METHOD || !i1.has_arg) return 0;
 
     // Replace first instruction with CACHE_METHOD0
@@ -350,13 +321,11 @@ static int rule_cache_method0(rewrite_t *rw, size_t off,
     return 1;
 }
 
-// Rule: CALL_METHOD n → CALL_METHOD_CACHED n
+// 8) Rule: CALL_METHOD n → CALL_METHOD_CACHED n
 static int rule_call_method_cached(rewrite_t *rw, size_t off, instr_t i0) {
     if (i0.op != MP_BC_CALL_METHOD || !i0.has_arg) return 0;
-
     // Replace with CALL_METHOD_CACHED, keep the arg
     write_byte_keep(rw, off, MP_BC_CALL_METHOD_CACHED);
-
     return 1;
 }
 
@@ -399,7 +368,6 @@ size_t mp_peephole_optimize(uint8_t *bytecode, size_t len) {
 
         // Full cache collapses
         if (!changed) changed = rule_cache_add_full(&rw, off, i0, i1, i2, i3, &cm);
-        if (!changed) changed = rule_cache_sub_full(&rw, off, i0, i1, i2, i3, &cm);
 
         // Seed and collapse for += / -= patterns on locals
         if (!changed) changed = rule_seed_and_collapse_add(&rw, off, i0, i1, i2, i3, &cm);
