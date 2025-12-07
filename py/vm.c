@@ -247,6 +247,27 @@ MP_NOINLINE static mp_obj_t *build_slice_stack_allocated(byte op, mp_obj_t *sp, 
 }
 #endif
 
+// Add this helper near the top of vm.c (static scope).
+static inline mp_obj_t mp_normalize_awaitable(mp_obj_t o)
+{
+    // Fast path: already a generator/coroutine
+    if (mp_obj_is_type(o, &mp_type_gen_instance))
+    {
+        return o;
+    }
+    // If object defines __await__, call it to obtain the awaitable iterator
+    mp_obj_t dest[2];
+    if (mp_load_method_maybe(o, MP_QSTR___await__, dest))
+    {
+        // Bound method call: no args, no kwargs
+        mp_obj_t iter = mp_call_method_n_kw(0, 0, dest);
+        // Prefer generator/coroutine; if not, still return whatever was produced
+        return iter;
+    }
+    // As a fallback, return as-is (will error in mp_resume if unsupported)
+    return o;
+}
+
 // fastn has items in reverse order (fastn[0] is local[0], fastn[-1] is local[1], etc)
 // sp points to bottom of stack which grows up
 // returns:
@@ -1278,68 +1299,72 @@ run_code_state_from_return:;
                     DISPATCH();
                 }
 
-                ENTRY(MP_BC_RETURN_VALUE) : MARK_EXC_IP_SELECTIVE();
-            unwind_return:
-                // Search for and execute finally handlers that aren't already active
-                while (exc_sp >= exc_stack)
+                ENTRY(MP_BC_RETURN_VALUE) :
                 {
-                    if (MP_TAGPTR_TAG1(exc_sp->val_sp))
+                    MARK_EXC_IP_SELECTIVE();
+
+                unwind_return:
+                    // Execute finally handlers that aren't already active
+                    while (exc_sp >= exc_stack)
                     {
-                        if (exc_sp->handler >= ip)
+                        mp_exc_stack_t *cur = exc_sp;
+                        mp_uint_t tag1 = MP_TAGPTR_TAG1(cur->val_sp);
+
+                        if (tag1)
                         {
-                            // Found a finally handler that isn't active; run it.
-                            // Getting here the stack looks like:
-                            //     (..., X, [iter0, iter1, ...,] ret_val)
-                            // where X is pointed to by exc_sp->val_sp and in the case
-                            // of a "with" block contains the context manager info.
-                            // There may be 0 or more for-iterators between X and the
-                            // return value, and these must be removed before control can
-                            // pass to the finally code.  We simply copy the ret_value down
-                            // over these iterators, if they exist.  If they don't then the
-                            // following is a null operation.
-                            mp_obj_t *finally_sp = MP_TAGPTR_PTR(exc_sp->val_sp);
-                            finally_sp[1] = sp[0];
-                            sp = &finally_sp[1];
-                            // We're going to run "finally" code as a coroutine
-                            // (not calling it recursively). Set up a sentinel
-                            // on a stack so it can return back to us when it is
-                            // done (when WITH_CLEANUP or END_FINALLY reached).
-                            PUSH(MP_OBJ_NEW_SMALL_INT(-1));
-                            ip = exc_sp->handler;
-                            goto dispatch_loop;
+                            const byte *cur_handler = cur->handler;
+                            if (cur_handler >= ip)
+                            {
+                                // Found a non-active finally handler; run it.
+                                // Stack: (..., X, [iters...], ret_val)
+                                // Move ret_val down over any for-iterators.
+                                mp_obj_t *finally_sp = MP_TAGPTR_PTR(cur->val_sp);
+                                finally_sp[1] = sp[0];
+                                sp = &finally_sp[1];
+
+                                // Push sentinel for coroutine-style finally execution.
+                                PUSH(MP_OBJ_NEW_SMALL_INT(-1));
+
+                                // Jump to finally handler.
+                                ip = cur_handler;
+                                goto dispatch_loop;
+                            }
+                            else
+                            {
+                                // Found an already active finally; cancel it.
+                                CANCEL_ACTIVE_FINALLY(sp);
+                            }
                         }
-                        else
-                        {
-                            // Found a finally handler that is already active; cancel it.
-                            CANCEL_ACTIVE_FINALLY(sp);
-                        }
+
+                        // Pop current exception/finally block unconditionally.
+                        POP_EXC_BLOCK();
                     }
-                    POP_EXC_BLOCK();
-                }
-                nlr_pop();
-                code_state->sp = sp;
-                assert(exc_sp == exc_stack - 1);
-                MICROPY_VM_HOOK_RETURN
+
+                    // No more finally handlers to run; finish return.
+                    nlr_pop();
+                    code_state->sp = sp;
+                    assert(exc_sp == exc_stack - 1);
+                    MICROPY_VM_HOOK_RETURN
+
 #if MICROPY_STACKLESS
-                if (code_state->prev != NULL)
-                {
-                    mp_obj_t res = *sp;
-                    mp_globals_set(code_state->old_globals);
-                    mp_code_state_t *new_code_state = code_state->prev;
+                    if (code_state->prev != NULL)
+                    {
+                        mp_obj_t res = *sp;
+                        mp_globals_set(code_state->old_globals);
+                        mp_code_state_t *new_code_state = code_state->prev;
 #if MICROPY_ENABLE_PYSTACK
-                    // Free code_state, and args allocated by mp_call_prepare_args_n_kw_var
-                    // (The latter is implicitly freed when using pystack due to its LIFO nature.)
-                    // The sizeof in the following statement does not include the size of the variable
-                    // part of the struct.  This arg is anyway not used if pystack is enabled.
-                    mp_nonlocal_free(code_state, sizeof(mp_code_state_t));
+                        // Free code_state (variable-sized portion handled by pystack LIFO).
+                        mp_nonlocal_free(code_state, sizeof(mp_code_state_t));
 #endif
-                    code_state = new_code_state;
-                    *code_state->sp = res;
-                    goto run_code_state_from_return;
+                        code_state = new_code_state;
+                        *code_state->sp = res;
+                        goto run_code_state_from_return;
+                    }
+#endif
+
+                    FRAME_LEAVE();
+                    return MP_VM_RETURN_NORMAL;
                 }
-#endif
-                FRAME_LEAVE();
-                return MP_VM_RETURN_NORMAL;
 
                 ENTRY(MP_BC_RAISE_LAST) :
                 {
@@ -1390,47 +1415,49 @@ run_code_state_from_return:;
                 ENTRY(MP_BC_YIELD_FROM) :
                 {
                     MARK_EXC_IP_SELECTIVE();
-                    mp_vm_return_kind_t ret_kind;
-                    mp_obj_t send_value = POP();
-                    mp_obj_t t_exc = MP_OBJ_NULL;
-                    mp_obj_t ret_value;
-                    code_state->sp = sp; // Save sp because it's needed if mp_resume raises StopIteration
-                    if (inject_exc != MP_OBJ_NULL)
-                    {
-                        t_exc = inject_exc;
-                        inject_exc = MP_OBJ_NULL;
-                        ret_kind = mp_resume(TOP(), MP_OBJ_NULL, t_exc, &ret_value);
-                    }
-                    else
-                    {
-                        ret_kind = mp_resume(TOP(), send_value, MP_OBJ_NULL, &ret_value);
-                    }
 
-                    if (ret_kind == MP_VM_RETURN_YIELD)
+                    mp_obj_t send_value = POP();
+                    mp_obj_t t_exc = inject_exc;
+                    inject_exc = MP_OBJ_NULL;
+
+                    // Normalize TOP() into a proper awaitable/generator if needed
+                    mp_obj_t await_obj = TOP();
+                    await_obj = mp_normalize_awaitable(await_obj);
+                    SET_TOP(await_obj);
+
+                    mp_obj_t ret_value;
+                    code_state->sp = sp; // needed if mp_resume raises StopIteration
+
+                    // Single mp_resume call (fast path when t_exc == NULL)
+                    mp_vm_return_kind_t ret_kind = mp_resume(
+                        await_obj,
+                        (t_exc == MP_OBJ_NULL) ? send_value : MP_OBJ_NULL,
+                        t_exc,
+                        &ret_value);
+
+                    switch (ret_kind)
                     {
+                    case MP_VM_RETURN_YIELD:
+                        // Re-run this opcode on next resume
                         ip--;
                         PUSH(ret_value);
                         goto yield;
-                    }
-                    else if (ret_kind == MP_VM_RETURN_NORMAL)
-                    {
-                        // The generator has finished, and returned a value via StopIteration
-                        // Replace exhausted generator with the returned value
+
+                    case MP_VM_RETURN_NORMAL:
+                        // Generator finished; replace it with returned value
                         SET_TOP(ret_value);
-                        // If we injected GeneratorExit downstream, then even
-                        // if it was swallowed, we re-raise GeneratorExit
-                        if (t_exc != MP_OBJ_NULL && mp_obj_exception_match(t_exc, MP_OBJ_FROM_PTR(&mp_type_GeneratorExit)))
+                        // If we injected GeneratorExit downstream, re-raise it even if swallowed
+                        if (t_exc != MP_OBJ_NULL &&
+                            mp_obj_exception_match(t_exc, MP_OBJ_FROM_PTR(&mp_type_GeneratorExit)))
                         {
                             mp_obj_t raise_t = mp_make_raise_obj(t_exc);
                             RAISE(raise_t);
                         }
                         DISPATCH();
-                    }
-                    else
-                    {
-                        assert(ret_kind == MP_VM_RETURN_EXCEPTION);
+
+                    case MP_VM_RETURN_EXCEPTION:
+                        // Exception other than StopIteration: unwind and raise
                         assert(!mp_obj_exception_match(ret_value, MP_OBJ_FROM_PTR(&mp_type_StopIteration)));
-                        // Pop exhausted gen
                         sp--;
                         RAISE(ret_value);
                     }
@@ -1504,73 +1531,75 @@ run_code_state_from_return:;
 
                 ENTRY(MP_BC_UNCACHE1) : code_state->cached_values[1] = MP_OBJ_NULL;
                 DISPATCH();
-    
-                ENTRY(MP_BC_INC_FAST): {
+
+                ENTRY(MP_BC_INC_FAST) :
+                {
                     // arg = local index (varuint)
                     mp_uint_t local = mp_decode_uint(&ip);
                     mp_obj_t val = code_state->state[local];
-                
+
                     // val = val + 1 (generic, works for ints, floats, etc.)
                     mp_obj_t res = mp_binary_op(MP_BINARY_OP_ADD, val, MP_OBJ_NEW_SMALL_INT(1));
                     code_state->state[local] = res;
-                
-                    DISPATCH();
-                }
-                
-                ENTRY(MP_BC_DEC_FAST): {
-                    mp_uint_t local = mp_decode_uint(&ip);
-                    mp_obj_t val = code_state->state[local];
-                
-                    // val = val - 1
-                    mp_obj_t res = mp_binary_op(MP_BINARY_OP_SUBTRACT, val, MP_OBJ_NEW_SMALL_INT(1));
-                    code_state->state[local] = res;
-                
+
                     DISPATCH();
                 }
 
-                ENTRY(MP_BC_CALL_METHOD_CACHED): {
+                ENTRY(MP_BC_DEC_FAST) :
+                {
+                    mp_uint_t local = mp_decode_uint(&ip);
+                    mp_obj_t val = code_state->state[local];
+
+                    // val = val - 1
+                    mp_obj_t res = mp_binary_op(MP_BINARY_OP_SUBTRACT, val, MP_OBJ_NEW_SMALL_INT(1));
+                    code_state->state[local] = res;
+
+                    DISPATCH();
+                }
+
+                ENTRY(MP_BC_CALL_METHOD_CACHED) :
+                {
                     // First decode the argument: number of positional args
                     mp_uint_t n_args = mp_decode_uint(&ip);
-                
+
                     // Cached method object is stored in the code_state (like LOAD_METHOD cache).
                     // For simplicity, assume slot0 holds the cached method function pointer.
                     // You can extend this to multiple slots if needed.
                     mp_obj_t meth = code_state->cached_method0;
                     mp_obj_t self = code_state->cached_self0;
-                
+
                     // Collect arguments from the stack
                     mp_obj_t *args = &sp[-n_args];
                     sp -= n_args;
-                
+
                     // Call the method: meth(self, *args)
                     mp_obj_t res = mp_call_method_n_kw(n_args, 0, args, self, meth);
-                
+
                     // Push result back
                     *++sp = res;
-                
+
                     DISPATCH();
                 }
 
-                ENTRY(MP_BC_CACHE_METHOD0): {
+                ENTRY(MP_BC_CACHE_METHOD0) :
+                {
                     // Decode varuint: local index of the object
                     mp_uint_t local = mp_decode_uint(&ip);
                     mp_obj_t obj = code_state->state[local];
-                
+
                     // Next varuint: qstr of the method name
                     mp_uint_t qst = mp_decode_uint(&ip);
-                
+
                     // Lookup method
                     mp_obj_t dest[2];
                     mp_load_method(obj, qst, dest);
-                
+
                     // Seed the cache
                     code_state->cached_self0 = dest[0];   // self
                     code_state->cached_method0 = dest[1]; // method function
-                
+
                     DISPATCH();
                 }
-                
-                
 
 #if MICROPY_OPT_COMPUTED_GOTO
                 ENTRY(MP_BC_LOAD_CONST_SMALL_INT_MULTI) : PUSH(MP_OBJ_NEW_SMALL_INT((mp_int_t)ip[-1] - MP_BC_LOAD_CONST_SMALL_INT_MULTI - MP_BC_LOAD_CONST_SMALL_INT_MULTI_EXCESS));
